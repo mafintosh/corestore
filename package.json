@@ -35,6 +35,7 @@
     "hypercore-crypto": "^2.0.0",
     "hypercore-protocol": "^8.0.0",
     "nanoresource": "^1.3.0",
+    "random-access-storage": "^1.4.1",
     "refpool": "^1.2.0"
   }
 }

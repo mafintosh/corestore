@@ -4,6 +4,7 @@ const hypercore = require('hypercore')
 const hypercoreCrypto = require('hypercore-crypto')
 const datEncoding = require('dat-encoding')
 const maybe = require('call-me-maybe')
+const RAS = require('random-access-storage')
 
 const RefPool = require('refpool')
 const deriveSeed = require('derive-key')
@@ -25,6 +26,7 @@ class InnerCorestore extends Nanoresource {
     this.opts = opts
 
     this._replicationStreams = []
+    this.loadingState = new Map()
     this.cache = new RefPool({
       maxSize: opts.cacheSize || 1000,
       close: core => {
@@ -47,16 +49,28 @@ class InnerCorestore extends Nanoresource {
   _open (cb) {
     if (this._masterKey) return cb()
     const keyStorage = this.storage(MASTER_KEY_FILENAME)
+    const done = (err) => {
+      if (err) return cb(err)
+
+      for (const [name, core] of this.loadingState) {
+        const generatedKeys = this._generateKeys({ name })
+        this.cache.set(encodeKey(generatedKeys.discoveryKey), core)
+      }
+
+      this.loadingState = null
+
+      cb(null)
+    }
     keyStorage.read(0, 32, (err, key) => {
       if (err) {
         this._masterKey = hypercoreCrypto.randomBytes(32)
         return keyStorage.write(0, this._masterKey, err => {
           if (err) return cb(err)
-          keyStorage.close(cb)
+          keyStorage.close(done)
         })
       }
       this._masterKey = key
-      keyStorage.close(cb)
+      keyStorage.close(done)
     })
   }
 
@@ -154,7 +168,7 @@ class InnerCorestore extends Nanoresource {
     }
     if (coreOpts.default || coreOpts.name) {
       if (!coreOpts.name) throw new Error('If the default option is set, a name must be specified.')
-      return this._generateKeyPair(coreOpts.name)
+      return this._masterKey ? this._generateKeyPair(coreOpts.name) : { publicKey: null, secretKey: null, discoveryKey: null, name: coreOpts.name }
     }
     if (coreOpts.discoveryKey) {
       const discoveryKey = decodeKey(coreOpts.discoveryKey)
@@ -183,32 +197,39 @@ class InnerCorestore extends Nanoresource {
   }
 
   get (coreOpts = {}) {
-    if (!this.opened) throw new Error('Corestore.ready must be called before get.')
+    // if (!this.opened) throw new Error('Corestore.ready must be called before get.')
 
     const self = this
 
-    const generatedKeys = this._generateKeys(coreOpts)
-    const { publicKey, discoveryKey, secretKey } = generatedKeys
-    const id = encodeKey(discoveryKey)
+    let generatedKeys = this._generateKeys(coreOpts)
 
-    const cached = this.cache.get(id)
+    let { publicKey, discoveryKey, secretKey, name } = generatedKeys
+    let id = (discoveryKey || this.opened) && encodeKey(discoveryKey)
+
+    const cached = this.cache.get(id) || (this.loadingState && name && this.loadingState.get(name.toString()))
     if (cached) return cached
 
-    const storageRoot = [id.slice(0, 2), id.slice(2, 4), id].join('/')
+    let storageRoot = discoveryKey ? [id.slice(0, 2), id.slice(2, 4), id].join('/') : null
 
     const keyStorage = derivedStorage(createStorage, (name, cb) => {
-      if (name) {
-        const res = this._generateKeyPair(name)
-        if (discoveryKey && (!discoveryKey.equals((res.discoveryKey)))) {
-          return cb(new Error('Stored an incorrect name.'))
+      self.open((err) => {
+        if (err) return cb(err)
+        upsert()
+
+        if (name) {
+          const res = this._generateKeyPair(name)
+          if (discoveryKey && (!discoveryKey.equals((res.discoveryKey)))) {
+            return cb(new Error('Stored an incorrect name.'))
+          }
+          return cb(null, res)
         }
-        return cb(null, res)
-      }
-      if (secretKey) return cb(null, generatedKeys)
-      if (publicKey) return cb(null, { name: null, publicKey, secretKey: null })
-      const err = new Error('Unknown key pair.')
-      err.unknownKeyPair = true
-      return cb(err)
+
+        if (secretKey) return cb(null, generatedKeys)
+        if (publicKey) return cb(null, { name: null, publicKey, secretKey: null })
+        err = new Error('Unknown key pair.')
+        err.unknownKeyPair = true
+        return cb(err)
+      })
     })
 
     const cacheOpts = { ...this.opts.cache }
@@ -230,7 +251,8 @@ class InnerCorestore extends Nanoresource {
       createIfMissing: !!publicKey
     })
 
-    this.cache.set(id, core)
+    if (id) this.cache.set(id, core)
+    else if (this.loadingState && name) this.loadingState.set(name.toString(), core)
     core.ifAvailable.wait()
 
     var errored = false
@@ -264,7 +286,27 @@ class InnerCorestore extends Nanoresource {
     }
 
     function createStorage (name) {
+      if (!self.opened && !discoveryKey) {
+        return new PendingFile((cb) => {
+          self.open((err) => {
+            if (err) return cb(err)
+            upsert()
+            cb(null, self.storage(storageRoot + '/' + name))
+          })
+        })
+      }
       return self.storage(storageRoot + '/' + name)
+    }
+
+    function upsert () {
+      if (!storageRoot) {
+        generatedKeys = self._generateKeys(coreOpts)
+        publicKey = generatedKeys.publicKey
+        discoveryKey = generatedKeys.discoveryKey
+        secretKey = generatedKeys.secretKey
+        id = encodeKey(discoveryKey)
+        storageRoot = [id.slice(0, 2), id.slice(2, 4), id].join('/')
+      }
     }
   }
 
@@ -305,6 +347,42 @@ class InnerCorestore extends Nanoresource {
         closed = true
       }
     }
+  }
+}
+
+class PendingFile extends RAS {
+  constructor (wait) {
+    super()
+    this._wait = wait
+    this._storage = null
+  }
+
+  _open (req) {
+    this._wait((err, storage) => {
+      if (err) return req.callback(err)
+      this._storage = storage
+      req.callback(null)
+    })
+  }
+
+  _stat (req) {
+    this._storage.stat(req.callback.bind(req))
+  }
+
+  _read (req) {
+    this._storage.read(req.offset, req.size, req.callback.bind(req))
+  }
+
+  _write (req) {
+    this._storage.write(req.offset, req.data, req.callback.bind(req))
+  }
+
+  _del (req) {
+    this._storage.delete(req.offset, req.size, req.callback.bind(req))
+  }
+
+  _close (req) {
+    this._storage.close(req.callback.bind(req))
   }
 }
 
